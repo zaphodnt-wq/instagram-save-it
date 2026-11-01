@@ -1,5 +1,7 @@
 import argparse
+import base64
 import getpass
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -12,6 +14,7 @@ import requests
 from rclone_transfer import DEFAULT_REMOTE_DEST, DEFAULT_STAGING_DIR, transfer_media, verify_media
 
 ARCHIVE_LOG_FILE = Path(__file__).parent / ".archived_shortcodes.txt"
+UNSAVED_LOG_FILE = Path(__file__).parent / ".unsaved_shortcodes.txt"
 SESSION_DIR = Path(__file__).parent / ".sessions"
 
 
@@ -265,6 +268,121 @@ def clean_staging(staging_dir: Path = DEFAULT_STAGING_DIR) -> None:
     print(f"Cleaned local staging directory: {staging_dir}")
 
 
+def unsave_posts(username: str, shortcodes: list[str]) -> list[str]:
+    """Unsave verified posts from the user's Instagram Saved collection."""
+    if not shortcodes:
+        return []
+
+    loader = create_instaloader(DEFAULT_STAGING_DIR)
+    session_path = get_session_path(username)
+    if session_path.exists():
+        loader.load_session_from_file(username, str(session_path))
+    else:
+        loader.load_session_from_file(username)
+
+    session = loader.context._session
+
+    # Refresh cookies via an authenticated GET and deduplicate cookie domains so
+    # Cookie: csrftoken and X-CSRFToken header match 100% on POST requests.
+    resp_init = session.get(
+        "https://www.instagram.com/api/v1/feed/saved/posts/",
+        params={"include_igtv_preview": "false"},
+        headers={
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.instagram.com/",
+        },
+        timeout=15,
+    )
+    clean_cookies: dict[str, str] = {}
+    for cookie in session.cookies:
+        clean_cookies[cookie.name] = cookie.value
+    for cookie in resp_init.cookies:
+        clean_cookies[cookie.name] = cookie.value
+
+    csrf = clean_cookies.get("csrftoken", "")
+    session.cookies.clear()
+    session.cookies.update(clean_cookies)
+    session.headers.update({"X-CSRFToken": csrf})
+    loader.save_session_to_file(str(session_path))
+
+    unsaved_now: list[str] = []
+    ds_user_id = clean_cookies.get("ds_user_id") or clean_cookies.get("sessionid", "").split(":")[0]
+    sessionid_val = clean_cookies.get("sessionid", "")
+    igt_token = base64.b64encode(
+        json.dumps(
+            {"ds_user_id": str(ds_user_id), "sessionid": sessionid_val},
+            separators=(",", ":"),
+        ).encode()
+    ).decode()
+
+    for shortcode in shortcodes:
+        media_id = instaloader.Post.shortcode_to_mediaid(shortcode)
+        errors: list[str] = []
+        success = False
+
+        # Attempt 1: Web endpoint (/web/save/<media_id>/unsave/)
+        web_url = f"https://www.instagram.com/web/save/{media_id}/unsave/"
+        resp_web = session.post(
+            web_url,
+            headers={
+                "X-CSRFToken": csrf,
+                "X-IG-App-ID": "936619743392459",
+                "X-Instagram-AJAX": "1",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://www.instagram.com",
+                "Referer": f"https://www.instagram.com/p/{shortcode}/",
+            },
+            timeout=15,
+        )
+        if resp_web.status_code == 200:
+            try:
+                if resp_web.json().get("status") == "ok":
+                    success = True
+            except Exception:
+                pass
+        if not success:
+            errors.append(f"web={resp_web.status_code}")
+
+        # Attempt 2: Mobile v1 API (i.instagram.com/api/v1/media/<media_id>/unsave/)
+        if not success:
+            mobile_headers = dict(loader.context.iphone_headers)
+            mobile_headers.update(
+                {
+                    "Authorization": f"Bearer IGT:2:{igt_token}",
+                    "ig-intended-user-id": str(ds_user_id),
+                    "ig-u-ds-user-id": str(ds_user_id),
+                }
+            )
+            resp_mob = requests.post(
+                f"https://i.instagram.com/api/v1/media/{media_id}/unsave/",
+                headers=mobile_headers,
+                data={"media_id": str(media_id), "module_name": "feed_contextual_saved_collections"},
+                timeout=15,
+            )
+            if resp_mob.status_code == 200:
+                try:
+                    if resp_mob.json().get("status") == "ok":
+                        success = True
+                except Exception:
+                    pass
+            if not success:
+                errors.append(f"mobile={resp_mob.status_code}:{resp_mob.text[:120].strip()}")
+
+        if success:
+            print(f"Unsaved post {shortcode} from Instagram.")
+            unsaved_now.append(shortcode)
+        else:
+            print(
+                f"Warning: could not unsave post {shortcode} ({', '.join(errors)}).",
+                file=sys.stderr,
+            )
+
+    if unsaved_now:
+        save_archived_shortcodes(unsaved_now, UNSAVED_LOG_FILE)
+    return unsaved_now
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Download Instagram saved posts and archive them to Google Drive via rclone."
@@ -303,6 +421,16 @@ def main() -> int:
         help="Delete local staging files after rclone check verifies upload integrity",
     )
     parser.add_argument(
+        "--unsave",
+        action="store_true",
+        help="Remove posts from your Instagram Saved list after Google Drive verification passes",
+    )
+    parser.add_argument(
+        "--reset-archive",
+        action="store_true",
+        help="Clear the local .archived_shortcodes.txt log before downloading",
+    )
+    parser.add_argument(
         "--remote",
         default=DEFAULT_REMOTE_DEST,
         help=f"rclone remote destination (default: {DEFAULT_REMOTE_DEST})",
@@ -315,6 +443,10 @@ def main() -> int:
         if args.login_only:
             return 0
 
+    if args.reset_archive and ARCHIVE_LOG_FILE.exists():
+        ARCHIVE_LOG_FILE.unlink()
+        print(f"Cleared archive history ({ARCHIVE_LOG_FILE.name}).")
+
     new_shortcodes = download_saved_posts(
         username=args.username,
         staging_dir=DEFAULT_STAGING_DIR,
@@ -324,6 +456,13 @@ def main() -> int:
 
     has_staged_files = DEFAULT_STAGING_DIR.exists() and any(DEFAULT_STAGING_DIR.iterdir())
     if not has_staged_files:
+        if args.unsave and not args.dry_run:
+            already_archived = load_archived_shortcodes(ARCHIVE_LOG_FILE)
+            already_unsaved = load_archived_shortcodes(UNSAVED_LOG_FILE)
+            pending_unsave = [c for c in already_archived if c not in already_unsaved]
+            if pending_unsave:
+                unsave_posts(args.username, pending_unsave)
+                return 0
         print("No files in staging to transfer.")
         return 0
 
@@ -340,6 +479,12 @@ def main() -> int:
 
     save_archived_shortcodes(new_shortcodes)
     print(f"Recorded {len(new_shortcodes)} post(s) in {ARCHIVE_LOG_FILE.name}.")
+
+    if args.unsave:
+        already_archived = load_archived_shortcodes(ARCHIVE_LOG_FILE)
+        already_unsaved = load_archived_shortcodes(UNSAVED_LOG_FILE)
+        to_unsave = list(dict.fromkeys(new_shortcodes + [c for c in already_archived if c not in already_unsaved]))
+        unsave_posts(args.username, to_unsave)
 
     if args.clean:
         clean_staging(DEFAULT_STAGING_DIR)

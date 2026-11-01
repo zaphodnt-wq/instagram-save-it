@@ -14,6 +14,7 @@ rclone.conf
 *credentials*.json
 *token*.json
 .archived_shortcodes.txt
+.unsaved_shortcodes.txt
 
 # Local Media & Staging Directories
 staging/
