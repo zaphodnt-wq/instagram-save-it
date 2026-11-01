@@ -89,6 +89,9 @@ rclone lsf gdrive:rclone/save
 
 ## To-Do List / Next Tasks
 
+- [ ] **Add Parallel Downloads (Goroutines) & Unsave Rate-Limit Pacing in Go (`instagram.go`):**
+  - Download 4 videos concurrently using Go goroutines (matching `rclone --transfers 4`) so large video files don't bottleneck `-n 10+` batches.
+  - Add a brief ~1-second pacing delay between `--unsave` `POST` requests on larger batches (`-n 25+`) to avoid Instagram `429 Too Many Requests` cooldowns.
 - [ ] **Create a Personal Google Cloud OAuth `client_id` for `rclone` (High Priority before 2026 retirement):**
   - *Quick Note:* Newer versions of `rclone` print a `NOTICE` that `rclone`'s shared built-in Google Drive `client_id` is being retired during 2026 (`https://rclone.org/drive/#making-your-own-client-id`).
   - *How to do it:* Create a personal OAuth Client ID in Google Cloud Console (**APIs & Services -> Credentials -> Create Credentials -> OAuth client ID**), make sure the Application type is set to **Desktop app** (not Web application), copy the `.apps.googleusercontent.com` Client ID and Client Secret into `rclone`, and authorize with `scope=drive.file`. This also removes `rclone`'s shared global API rate limit for even faster uploads!
