@@ -1,25 +1,40 @@
 # Instagram Save-It
 
-A lightweight Python + `rclone` pipeline for downloading and archiving saved Instagram media to cloud storage without risking remote deletions.
+A lightweight Python + `rclone` pipeline for downloading saved Instagram posts and archiving them to Google Drive (`gdrive:rclone/save`) using least-privilege `drive.file` OAuth access.
 
-## Architecture & Workflow
+## Architecture & Safety Guarantees
 
-1. **Fetch Media Locally**: Download Instagram saved posts/media (e.g., via `instaloader`) to a local staging directory.
-2. **Archive via `rclone copy`**: Copy media and metadata (`*.{jpg,jpeg,png,mp4,json}`) to remote cloud storage (`gdrive:`, `onedrive:`, etc.) using `rclone copy` (never `rclone sync`, so remote files are never deleted when cleaning up local staging).
-3. **Verify & Clean Up**: Optionally run `rclone check` to verify upload integrity before purging local staging files.
+1. **Least-Privilege Cloud Scope (`scope=drive.file`)**: `rclone` is restricted at Google's OAuth level so it can **only** see and write files inside the `rclone/save` folder it created—it has zero visibility into the rest of your Google Drive.
+2. **Fetch Saved Posts (`save_it.py`)**: Uses an authenticated Instagram session to download saved posts (`.mp4`, `.jpg`, `.txt` captions, and uncompressed `.json` metadata) into `./staging/`.
+3. **Archive via `rclone copy`**: Copies staged files to `gdrive:rclone/save` (never `rclone sync`, so remote files are never deleted when cleaning up local staging).
+4. **Verify & Deduplicate**: Runs `rclone check --one-way` to verify upload integrity before recording post shortcodes in `.archived_shortcodes.txt` and optionally cleaning `./staging/` (`--clean`).
 
-## Quick Verification Commands
+## Setup
 
 ```bash
-# List configured rclone remotes
-rclone listremotes
+# 1. Activate the virtual environment and install dependencies
+source .venv/bin/activate && pip install -r requirements.txt
 
-# Check remote connectivity and storage quota
-rclone about gdrive:
+# 2. Configure rclone with drive.file scope and create target folder
+rclone config create gdrive drive scope=drive.file
+rclone mkdir gdrive:rclone/save
 
-# Dry-run copy from staging to remote
-rclone copy ./staging gdrive:instagram_backup_test \
-  --dry-run \
-  -vv \
-  --include "*.{jpg,jpeg,png,mp4,json}"
+# 3. Save your Instagram session using your browser's sessionid cookie
+python save_it.py -u YOUR_IG_USERNAME --login-only --sessionid "YOUR_SESSIONID_COOKIE"
+```
+
+## Usage
+
+```bash
+# Dry-run: download 3 saved posts to ./staging and preview rclone transfer
+python save_it.py -u YOUR_IG_USERNAME -n 3 --dry-run
+
+# Live run: upload to gdrive:rclone/save, verify checksums, and clean ./staging
+python save_it.py -u YOUR_IG_USERNAME -n 3 --clean
+
+# Archive all new saved posts (stops automatically when it hits an already-archived post)
+python save_it.py -u YOUR_IG_USERNAME -n 0 --clean
+
+# List archived files in Google Drive
+rclone lsf gdrive:rclone/save
 ```

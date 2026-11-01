@@ -4,7 +4,10 @@ import shutil
 import sys
 from pathlib import Path
 
+import urllib.parse
+
 import instaloader
+import requests
 
 from rclone_transfer import DEFAULT_REMOTE_DEST, DEFAULT_STAGING_DIR, transfer_media, verify_media
 
@@ -45,7 +48,104 @@ def create_instaloader(staging_dir: Path) -> instaloader.Instaloader:
     )
 
 
-def login_and_save_session(username: str) -> None:
+def _verify_session_via_v1(loader: instaloader.Instaloader) -> bool:
+    """Verify the session against Instagram's active v1 saved posts endpoint."""
+    resp = loader.context._session.get(
+        "https://www.instagram.com/api/v1/feed/saved/posts/",
+        params={"include_igtv_preview": "false"},
+        headers={
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.instagram.com/",
+        },
+        timeout=15,
+    )
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+            return data.get("status") == "ok" and "items" in data
+        except Exception:
+            return False
+    return False
+
+
+def login_with_sessionid(username: str, sessionid: str) -> None:
+    """Create and verify an Instaloader session using a browser sessionid cookie."""
+    loader = create_instaloader(DEFAULT_STAGING_DIR)
+    session_path = get_session_path(username)
+
+    # Remove any accidental spaces/newlines and URL-decode %3A -> :
+    clean_sessionid = "".join(urllib.parse.unquote(sessionid).split()).strip("\"'")
+    ds_user_id = clean_sessionid.split(":")[0] if ":" in clean_sessionid else ""
+
+    temp_session = requests.Session()
+    temp_session.headers.update({"User-Agent": loader.context.user_agent})
+    temp_session.get("https://www.instagram.com/", timeout=15)
+    csrftoken = temp_session.cookies.get_dict().get("csrftoken", "missing")
+
+    cookie_dict = {
+        "sessionid": clean_sessionid,
+        "csrftoken": csrftoken,
+        "ds_user_id": ds_user_id,
+        "ig_cb": "1",
+    }
+    loader.context.load_session(username, cookie_dict)
+    if not _verify_session_via_v1(loader):
+        logged_in_user = loader.test_login()
+        if not logged_in_user:
+            raise RuntimeError(
+                "Could not verify login with the provided sessionid. "
+                "Make sure you copied the full 'sessionid' cookie value from an active instagram.com tab."
+            )
+
+    loader.save_session_to_file(str(session_path))
+    print(f"Verified login for @{username} and saved session to {session_path}")
+
+
+def _complete_two_factor_with_methods(
+    loader: instaloader.Instaloader, username: str, two_factor_code: str
+) -> bool:
+    """Try Instagram's v1 2FA endpoint across WhatsApp (6), Authenticator (3), SMS (1), and Backup (2)."""
+    if not loader.context.two_factor_auth_pending:
+        return False
+    session, user, two_factor_id = loader.context.two_factor_auth_pending
+    endpoints = [
+        "https://www.instagram.com/api/v1/web/accounts/login/ajax/two_factor/",
+        "https://www.instagram.com/accounts/login/ajax/two_factor/",
+    ]
+    # 6 = WhatsApp, 3 = TOTP Authenticator, 1 = SMS, 2 = Backup Code
+    for endpoint in endpoints:
+        for method in ("6", "3", "1", "2"):
+            resp = session.post(
+                endpoint,
+                data={
+                    "username": user,
+                    "verificationCode": two_factor_code,
+                    "identifier": two_factor_id,
+                    "verification_method": method,
+                    "trust_signal": "true",
+                },
+                allow_redirects=True,
+            )
+            try:
+                resp_json = resp.json()
+            except Exception:
+                continue
+            if resp_json.get("status") == "ok" and resp_json.get("authenticated"):
+                csrf = resp.cookies.get("csrftoken") or session.cookies.get_dict().get("csrftoken", "")
+                session.headers.update({"X-CSRFToken": csrf})
+                loader.context._session = session
+                loader.context.username = username
+                loader.context.two_factor_auth_pending = None
+                return True
+    return False
+
+
+def login_and_save_session(username: str, sessionid: str | None = None) -> None:
+    if sessionid:
+        login_with_sessionid(username, sessionid)
+        return
+
     loader = create_instaloader(DEFAULT_STAGING_DIR)
     session_path = get_session_path(username)
 
@@ -62,11 +162,56 @@ def login_and_save_session(username: str) -> None:
     try:
         loader.login(username, password)
     except instaloader.TwoFactorAuthRequiredException:
-        two_factor_code = input("Enter 2FA code: ").strip()
-        loader.two_factor_login(two_factor_code)
+        two_factor_code = input(
+            "Enter 2FA code (or an 8-digit Instagram backup code without spaces): "
+        ).strip().replace(" ", "")
+        if not _complete_two_factor_with_methods(loader, username, two_factor_code):
+            loader.two_factor_login(two_factor_code)
 
     loader.save_session_to_file(str(session_path))
     print(f"Saved Instagram session to {session_path}")
+
+
+def iter_saved_posts(loader: instaloader.Instaloader, username: str):
+    """Yield saved Post objects using Instagram's active v1 API (with GraphQL fallback)."""
+    max_id: str | None = None
+    used_v1 = False
+
+    while True:
+        params: dict[str, str] = {"include_igtv_preview": "false"}
+        if max_id:
+            params["max_id"] = max_id
+
+        resp = loader.context._session.get(
+            "https://www.instagram.com/api/v1/feed/saved/posts/",
+            params=params,
+            headers={
+                "X-IG-App-ID": "936619743392459",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"https://www.instagram.com/{username}/saved/all-posts/",
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            break
+
+        data = resp.json()
+        if data.get("status") != "ok" or "items" not in data:
+            break
+
+        used_v1 = True
+        for item in data.get("items", []):
+            media = item.get("media")
+            if media and "code" in media and "pk" in media:
+                yield instaloader.Post.from_iphone_struct(loader.context, media)
+
+        if not data.get("more_available") or not data.get("next_max_id"):
+            break
+        max_id = str(data["next_max_id"])
+
+    if not used_v1:
+        profile = instaloader.Profile.from_username(loader.context, username)
+        yield from profile.get_saved_posts()
 
 
 def download_saved_posts(
@@ -84,12 +229,11 @@ def download_saved_posts(
     else:
         loader.load_session_from_file(username)
 
-    profile = instaloader.Profile.from_username(loader.context, username)
     archived = load_archived_shortcodes()
     newly_downloaded: list[str] = []
 
     print(f"Fetching saved posts for @{username} (max_count={max_count})...")
-    for post in profile.get_saved_posts():
+    for post in iter_saved_posts(loader, username):
         if post.shortcode in archived:
             if fast_update:
                 print(f"Reached already-archived post {post.shortcode}; stopping (--fast-update).")
@@ -97,7 +241,7 @@ def download_saved_posts(
             print(f"Skipping already-archived post {post.shortcode}.")
             continue
 
-        print(f"Downloading saved post {post.shortcode} by @{post.owner_username}...")
+        print(f"Downloading saved post {post.shortcode}...")
         loader.download_post(post, target=staging_dir)
         newly_downloaded.append(post.shortcode)
 
@@ -131,6 +275,11 @@ def main() -> int:
         help="Log in to Instagram, save session file, and exit",
     )
     parser.add_argument(
+        "--sessionid",
+        nargs="+",
+        help="Instagram 'sessionid' cookie copied from a logged-in browser (bypasses 2FA)",
+    )
+    parser.add_argument(
         "-n",
         "--max-count",
         type=int,
@@ -159,9 +308,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.login_only:
-        login_and_save_session(args.username)
-        return 0
+    if args.login_only or args.sessionid:
+        raw_sessionid = "".join(args.sessionid) if args.sessionid else None
+        login_and_save_session(args.username, sessionid=raw_sessionid)
+        if args.login_only:
+            return 0
 
     new_shortcodes = download_saved_posts(
         username=args.username,
