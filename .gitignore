@@ -9,9 +9,11 @@ env/
 
 # Secrets, Sessions & Configs (Never commit!)
 *session*
+.sessions/
 rclone.conf
 *credentials*.json
 *token*.json
+.archived_shortcodes.txt
 
 # Local Media & Staging Directories
 staging/
