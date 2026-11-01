@@ -12,32 +12,29 @@ def transfer_media(
     remote_dest: str = DEFAULT_REMOTE_DEST,
     dry_run: bool = False,
 ) -> bool:
-    """Copy media and metadata files from source_dir to an rclone remote destination."""
+    """Copy media files from source_dir to an rclone remote destination with live progress."""
     cmd = [
         "rclone",
         "copy",
         str(source_dir),
         remote_dest,
-        "--include", "*.{jpg,jpeg,png,mp4,json,txt}",
+        "--include", "*.{jpg,jpeg,png,mp4}",
         "--transfers", "4",
         "--checkers", "8",
-        "--fast-list",
-        "--stats-one-line",
+        "--progress",
         "-v",
     ]
 
     if dry_run:
         cmd.append("--dry-run")
 
-    print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    print(f"Running: {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd)
 
     if result.returncode != 0:
-        print(f"rclone failed with code {result.returncode}:\n{result.stderr}", file=sys.stderr)
+        print(f"rclone failed with code {result.returncode}", file=sys.stderr)
         return False
 
-    output = (result.stdout + "\n" + result.stderr).strip()
-    print(f"rclone output:\n{output}")
     return True
 
 
@@ -45,22 +42,21 @@ def verify_media(
     source_dir: Path = DEFAULT_STAGING_DIR,
     remote_dest: str = DEFAULT_REMOTE_DEST,
 ) -> bool:
-    """Verify that all media/metadata files in source_dir exist and match on remote_dest."""
+    """Verify that all media files in source_dir exist and match on remote_dest."""
     cmd = [
         "rclone",
         "check",
         str(source_dir),
         remote_dest,
-        "--include", "*.{jpg,jpeg,png,mp4,json,txt}",
+        "--include", "*.{jpg,jpeg,png,mp4}",
         "--one-way",
     ]
-    print(f"Verifying: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    output = (result.stdout + "\n" + result.stderr).strip()
+    print(f"Verifying: {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd)
     if result.returncode != 0:
-        print(f"rclone check failed:\n{output}", file=sys.stderr)
+        print("rclone check failed!", file=sys.stderr)
         return False
-    print(f"rclone check passed:\n{output}")
+    print("rclone check passed!")
     return True
 
 
