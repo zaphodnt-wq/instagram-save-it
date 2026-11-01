@@ -10,7 +10,6 @@ import instaloader
 import requests
 
 from rclone_transfer import DEFAULT_REMOTE_DEST, DEFAULT_STAGING_DIR, transfer_media, verify_media
-from tag_media import tag_directory
 
 ARCHIVE_LOG_FILE = Path(__file__).parent / ".archived_shortcodes.txt"
 SESSION_DIR = Path(__file__).parent / ".sessions"
@@ -45,7 +44,8 @@ def create_instaloader(staging_dir: Path) -> instaloader.Instaloader:
         filename_pattern="{date_utc}_UTC_{shortcode}",
         compress_json=False,
         download_video_thumbnails=False,
-        save_metadata=True,
+        save_metadata=False,
+        post_metadata_txt_pattern="",
     )
 
 
@@ -326,8 +326,6 @@ def main() -> int:
     if not has_staged_files:
         print("No files in staging to transfer.")
         return 0
-
-    tag_directory(DEFAULT_STAGING_DIR)
 
     if not transfer_media(DEFAULT_STAGING_DIR, args.remote, dry_run=args.dry_run):
         return 1

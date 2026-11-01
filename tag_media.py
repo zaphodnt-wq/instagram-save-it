@@ -65,12 +65,14 @@ def extract_post_metadata(json_path: Path) -> dict[str, Any]:
 
     url = f"https://www.instagram.com/p/{shortcode}/" if shortcode else ""
 
-    # Build Title (first non-empty line of caption, or fallback to artist + shortcode)
+    # Build concise single-line Title so VLC's OSD doesn't wrap across vertical videos
     first_line = next((line.strip() for line in caption.splitlines() if line.strip()), "")
+    short_author = f"@{username}" if username else artist
     if first_line:
-        title = first_line[:120] + ("…" if len(first_line) > 120 else "")
+        raw_title = f"{short_author}: {first_line}" if short_author else first_line
+        title = raw_title[:38].rstrip() + ("…" if len(raw_title) > 38 else "")
     else:
-        title = f"{artist} - {shortcode}".strip(" -")
+        title = f"{short_author} ({shortcode})".strip()
 
     # Build full comment / description block for VLC (Ctrl+I -> Media Information)
     details: list[str] = []
@@ -228,9 +230,75 @@ def retag_remote_directory(remote_dest: str) -> bool:
         return True
 
 
+def clear_remote_tags_and_json(remote_dest: str) -> bool:
+    """Strip embedded tags from MP4/JPG files on remote_dest and remove .json/.txt sidecars."""
+    with tempfile.TemporaryDirectory(prefix="ig_clear_") as tmp:
+        tmp_dir = Path(tmp)
+        print(f"Downloading media from {remote_dest} to strip embedded tags...")
+        dl = subprocess.run(
+            [
+                "rclone",
+                "copy",
+                remote_dest,
+                str(tmp_dir),
+                "--include",
+                "*.{jpg,jpeg,mp4}",
+                "-v",
+                "--stats-one-line",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if dl.returncode != 0:
+            print(f"Failed to download from {remote_dest}:\n{dl.stderr}")
+            return False
+
+        cleared = 0
+        for media_path in sorted(tmp_dir.iterdir()):
+            if media_path.suffix.lower() == ".mp4":
+                video = MP4(str(media_path))
+                video.delete()
+                video.save()
+                cleared += 1
+                print(f"Cleared embedded tags from {media_path.name}")
+            elif media_path.suffix.lower() in {".jpg", ".jpeg"}:
+                piexif.remove(str(media_path))
+                cleared += 1
+                print(f"Cleared embedded EXIF from {media_path.name}")
+
+        if cleared:
+            print(f"Uploading {cleared} clean media file(s) back to {remote_dest}...")
+            ul = subprocess.run(
+                [
+                    "rclone",
+                    "copy",
+                    str(tmp_dir),
+                    remote_dest,
+                    "--include",
+                    "*.{jpg,jpeg,mp4}",
+                    "-v",
+                    "--stats-one-line",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if ul.returncode != 0:
+                print(f"Failed to upload clean files:\n{ul.stderr}")
+                return False
+
+        print(f"Removing .json and .txt sidecar files from {remote_dest}...")
+        subprocess.run(
+            ["rclone", "delete", remote_dest, "--include", "*.{json,txt}"],
+            capture_output=True,
+            text=True,
+        )
+        print(f"Done! {remote_dest} now contains only clean media files.")
+        return True
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Embed Instaloader JSON metadata into MP4 and JPG files for VLC Media Player."
+        description="Embed or clear Instaloader JSON metadata on MP4 and JPG files."
     )
     parser.add_argument(
         "-d",
@@ -241,11 +309,20 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--retag-remote",
-         nargs="?",
+        nargs="?",
         const="gdrive:rclone/save",
         help="Download existing files from rclone remote, tag MP4/JPGs, and re-upload (default: gdrive:rclone/save)",
     )
+    parser.add_argument(
+        "--clear-remote",
+        nargs="?",
+        const="gdrive:rclone/save",
+        help="Strip embedded tags and delete .json/.txt sidecar files on remote (default: gdrive:rclone/save)",
+    )
     args = parser.parse_args()
+
+    if args.clear_remote:
+        raise SystemExit(0 if clear_remote_tags_and_json(args.clear_remote) else 1)
 
     if args.retag_remote:
         raise SystemExit(0 if retag_remote_directory(args.retag_remote) else 1)
