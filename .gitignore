@@ -1,5 +1,7 @@
-# Compiled Go binary
+# Compiled Go binaries
 ig-save
+ig-save.exe
+ig-save-*
 
 # Python
 __pycache__/
