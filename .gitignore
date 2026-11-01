@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Secrets, Sessions & Configs (Never commit!)
+*session*
+rclone.conf
+*credentials*.json
+*token*.json
+
+# Local Media & Staging Directories
+staging/
+downloads/
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.json.xz
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
