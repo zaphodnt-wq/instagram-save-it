@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -186,20 +187,24 @@ func setWebHeaders(req *http.Request, sess *IGSession, referer string) {
 	req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
 }
 
-// DownloadSavedPosts fetches saved posts and downloads clean .mp4 / .jpg files into stagingDir.
-func DownloadSavedPosts(sess *IGSession, stagingDir string, maxCount int, fastUpdate bool, archived map[string]bool) ([]string, error) {
+// DownloadSavedPosts fetches saved posts and downloads clean .mp4 / .jpg files into stagingDir
+// using a pool of concurrent worker goroutines.
+func DownloadSavedPosts(sess *IGSession, stagingDir string, maxCount int, workers int, fastUpdate bool, archived map[string]bool) ([]string, error) {
 	if err := os.MkdirAll(stagingDir, 0755); err != nil {
 		return nil, err
 	}
+	if workers < 1 {
+		workers = 1
+	}
 
-	fmt.Printf("Fetching saved posts for @%s (max_count=%d)...\n", sess.Username, maxCount)
-	var newlyDownloaded []string
+	fmt.Printf("Fetching saved posts for @%s (max_count=%d, workers=%d)...\n", sess.Username, maxCount, workers)
+	var toDownload []*igMedia
 	maxID := ""
 
 	for {
 		page, err := fetchSavedPage(sess, maxID)
 		if err != nil {
-			return newlyDownloaded, err
+			return nil, err
 		}
 		_ = writeSessionFile(sess)
 
@@ -220,14 +225,10 @@ func DownloadSavedPosts(sess *IGSession, stagingDir string, maxCount int, fastUp
 				continue
 			}
 
-			fmt.Printf("Downloading saved post %s...\n", media.Code)
-			if err := downloadMediaItem(media, stagingDir); err != nil {
-				return newlyDownloaded, fmt.Errorf("failed downloading %s: %w", media.Code, err)
-			}
-			newlyDownloaded = append(newlyDownloaded, media.Code)
+			toDownload = append(toDownload, media)
 
-			if maxCount > 0 && len(newlyDownloaded) >= maxCount {
-				fmt.Printf("Reached max_count=%d posts for this run.\n", maxCount)
+			if maxCount > 0 && len(toDownload) >= maxCount {
+				fmt.Printf("Queued max_count=%d posts for download.\n", maxCount)
 				stop = true
 				break
 			}
@@ -242,11 +243,72 @@ func DownloadSavedPosts(sess *IGSession, stagingDir string, maxCount int, fastUp
 		}
 	}
 
+	if len(toDownload) == 0 {
+		fmt.Printf("Downloaded 0 new saved post(s) into %s.\n", stagingDir)
+		return nil, nil
+	}
+
+	numWorkers := workers
+	if len(toDownload) < numWorkers {
+		numWorkers = len(toDownload)
+	}
+
+	type downloadJob struct {
+		idx   int
+		media *igMedia
+	}
+
+	jobs := make(chan downloadJob, len(toDownload))
+	succeeded := make([]bool, len(toDownload))
+	errs := make([]error, len(toDownload))
+
+	transport := &http.Transport{
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: numWorkers * 2,
+		IdleConnTimeout:     60 * time.Second,
+	}
+	dlClient := &http.Client{
+		Transport: transport,
+		Timeout:   90 * time.Second,
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				fmt.Printf("Downloading saved post %s...\n", job.media.Code)
+				if err := downloadMediaItem(dlClient, job.media, stagingDir); err != nil {
+					errs[job.idx] = fmt.Errorf("failed downloading %s: %w", job.media.Code, err)
+					continue
+				}
+				succeeded[job.idx] = true
+			}
+		}()
+	}
+
+	for idx, media := range toDownload {
+		jobs <- downloadJob{idx: idx, media: media}
+	}
+	close(jobs)
+	wg.Wait()
+
+	var newlyDownloaded []string
+	var firstErr error
+	for idx, media := range toDownload {
+		if succeeded[idx] {
+			newlyDownloaded = append(newlyDownloaded, media.Code)
+		} else if errs[idx] != nil && firstErr == nil {
+			firstErr = errs[idx]
+		}
+	}
+
 	fmt.Printf("Downloaded %d new saved post(s) into %s.\n", len(newlyDownloaded), stagingDir)
-	return newlyDownloaded, nil
+	return newlyDownloaded, firstErr
 }
 
-func downloadMediaItem(media *igMedia, stagingDir string) error {
+func downloadMediaItem(client *http.Client, media *igMedia, stagingDir string) error {
 	ts := time.Unix(media.TakenAt, 0).UTC().Format("2006-01-02_15-04-05")
 	baseName := fmt.Sprintf("%s_UTC_%s", ts, media.Code)
 
@@ -258,7 +320,7 @@ func downloadMediaItem(media *igMedia, stagingDir string) error {
 				continue
 			}
 			dest := filepath.Join(stagingDir, fmt.Sprintf("%s_%d%s", baseName, idx+1, ext))
-			if err := downloadFile(urlStr, dest); err != nil {
+			if err := downloadFile(client, urlStr, dest); err != nil {
 				return err
 			}
 		}
@@ -271,7 +333,7 @@ func downloadMediaItem(media *igMedia, stagingDir string) error {
 		return fmt.Errorf("no media URL found for post %s", media.Code)
 	}
 	dest := filepath.Join(stagingDir, baseName+ext)
-	return downloadFile(urlStr, dest)
+	return downloadFile(client, urlStr, dest)
 }
 
 func extractMediaURL(m *igMedia) (string, string) {
@@ -284,13 +346,12 @@ func extractMediaURL(m *igMedia) (string, string) {
 	return "", ""
 }
 
-func downloadFile(urlStr, destPath string) error {
+func downloadFile(client *http.Client, urlStr, destPath string) error {
 	if _, err := os.Stat(destPath); err == nil {
 		fmt.Printf("  %s exists\n", destPath)
 		return nil
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(urlStr)
 	if err != nil {
 		return err
@@ -301,20 +362,33 @@ func downloadFile(urlStr, destPath string) error {
 		return fmt.Errorf("HTTP %d downloading %s", resp.StatusCode, urlStr)
 	}
 
-	out, err := os.Create(destPath)
+	partPath := destPath + ".part"
+	out, err := os.Create(partPath)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	_, copyErr := io.Copy(out, resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(partPath)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(partPath)
+		return closeErr
+	}
+
+	if err := os.Rename(partPath, destPath); err != nil {
+		_ = os.Remove(partPath)
 		return err
 	}
 	fmt.Printf("  saved %s\n", destPath)
 	return nil
 }
 
-// UnsavePosts removes verified posts from the user's Instagram Saved collection.
+// UnsavePosts removes verified posts from the user's Instagram Saved collection,
+// with a 1-second rate-limit guard between requests.
 func UnsavePosts(sess *IGSession, shortcodes []string) []string {
 	if len(shortcodes) == 0 {
 		return nil
@@ -332,7 +406,10 @@ func UnsavePosts(sess *IGSession, shortcodes []string) []string {
 	client := &http.Client{Timeout: 15 * time.Second}
 
 	var unsaved []string
-	for _, code := range shortcodes {
+	for idx, code := range shortcodes {
+		if idx > 0 {
+			time.Sleep(1 * time.Second)
+		}
 		mediaID := shortcodeToMediaID(code)
 		if unsaveViaWeb(client, sess, code, mediaID) || unsaveViaMobile(client, sess, igtToken, mediaID) {
 			fmt.Printf("Unsaved post %s from Instagram.\n", code)

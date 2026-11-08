@@ -98,25 +98,51 @@ func pendingUnsaveList(newCodes []string) []string {
 }
 
 func main() {
-	username := flag.String("u", "", "Your Instagram username (required)")
-	flag.StringVar(username, "username", "", "Your Instagram username (required)")
+	username := flag.String("u", "", "Your Instagram username (required unless running --move-to-local standalone)")
+	flag.StringVar(username, "username", "", "Your Instagram username (required unless running --move-to-local standalone)")
 	loginOnly := flag.Bool("login-only", false, "Verify sessionid cookie, save session file, and exit")
 	sessionID := flag.String("sessionid", "", "Instagram 'sessionid' cookie from a logged-in browser")
 	maxCount := flag.Int("n", 10, "Maximum number of saved posts to download per run (0 for unlimited)")
 	flag.IntVar(maxCount, "max-count", 10, "Maximum number of saved posts to download per run (0 for unlimited)")
+	workers := flag.Int("w", 4, "Number of concurrent download workers (default: 4)")
+	flag.IntVar(workers, "workers", 4, "Number of concurrent download workers (default: 4)")
 	noFastUpdate := flag.Bool("no-fast-update", false, "Continue scanning past already-archived posts")
-	dryRun := flag.Bool("dry-run", false, "Run rclone copy in --dry-run mode without uploading or unsaving")
+	dryRun := flag.Bool("dry-run", false, "Run rclone in --dry-run mode without modifying remote/local files or unsaving")
 	clean := flag.Bool("clean", false, "Delete local staging files after rclone check verifies upload integrity")
-	unsave := flag.Bool("unsave", false, "Remove posts from your Instagram Saved list after Drive verification")
+	unsave := flag.Bool("unsave", false, "Remove posts from your Instagram Saved list after destination verification")
 	resetArchive := flag.Bool("reset-archive", false, "Clear .archived_shortcodes.txt before downloading")
-	remote := flag.String("remote", DefaultRemoteDest, "rclone remote destination")
+	remote := flag.String("remote", DefaultRemoteDest, "rclone destination (default: gdrive:rclone/save)")
+	localDir := flag.String("local-dir", "", "Save directly from ./staging to a local directory (e.g. Y:\\eDrive\\instagram1\\instaGramDL9) instead of Google Drive")
+	flag.StringVar(localDir, "d", "", "Save directly from ./staging to a local directory instead of Google Drive")
+	moveToLocal := flag.String("move-to-local", "", "Move saved files from --remote (gdrive:rclone/save) to a local directory (e.g. Y:\\eDrive\\instagram1\\instaGramDL9) via rclone move")
+	flag.StringVar(moveToLocal, "m", "", "Move saved files from --remote (gdrive:rclone/save) to a local directory via rclone move")
 
 	flag.Parse()
 
+	// Standalone mode: if --move-to-local is specified without -u, drain --remote into the local directory and exit.
+	if *username == "" && *moveToLocal != "" {
+		if err := MoveRemoteToLocal(*remote, *moveToLocal, *dryRun); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if *username == "" {
-		fmt.Fprintln(os.Stderr, "Error: -u <instagram_username> is required.")
+		fmt.Fprintln(os.Stderr, "Error: -u <instagram_username> is required (or pass --move-to-local <PATH> standalone).")
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	destTarget := *remote
+	if *localDir != "" {
+		destTarget = *localDir
+		if !*dryRun {
+			if err := os.MkdirAll(destTarget, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating local directory %s: %v\n", destTarget, err)
+				os.Exit(1)
+			}
+		}
 	}
 
 	// Step 1: Login / Session Setup
@@ -152,9 +178,9 @@ func main() {
 		fmt.Printf("Cleared archive history (%s).\n", ArchiveLogFile)
 	}
 
-	// Step 2: Download Saved Posts to ./staging
+	// Step 2: Download Saved Posts to ./staging (in parallel using -w workers)
 	archived := loadShortcodeSet(ArchiveLogFile)
-	newCodes, err := DownloadSavedPosts(sess, DefaultStagingDir, *maxCount, !*noFastUpdate, archived)
+	newCodes, err := DownloadSavedPosts(sess, DefaultStagingDir, *maxCount, *workers, !*noFastUpdate, archived)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error fetching saved posts: %v\n", err)
 		os.Exit(1)
@@ -166,26 +192,38 @@ func main() {
 			if len(pending) > 0 {
 				unsaved := UnsavePosts(sess, pending)
 				_ = appendShortcodes(UnsavedLogFile, unsaved)
-				return
 			}
+		}
+		if *moveToLocal != "" {
+			if err := MoveRemoteToLocal(*remote, *moveToLocal, *dryRun); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
 		}
 		fmt.Println("No files in staging to transfer.")
 		return
 	}
 
-	// Step 3: Upload to Google Drive via rclone copy
-	if err := TransferMedia(DefaultStagingDir, *remote, *dryRun); err != nil {
+	// Step 3: Transfer from ./staging to destination (Google Drive or --local-dir) via rclone copy
+	if err := TransferMedia(DefaultStagingDir, destTarget, *dryRun); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
 	if *dryRun {
+		if *moveToLocal != "" {
+			if err := MoveRemoteToLocal(*remote, *moveToLocal, true); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
 		fmt.Println("Dry-run complete. Staging files and archive log were not modified.")
 		return
 	}
 
 	// Step 4: Verify Checksums via rclone check --one-way
-	if err := VerifyMedia(DefaultStagingDir, *remote); err != nil {
+	if err := VerifyMedia(DefaultStagingDir, destTarget); err != nil {
 		fmt.Fprintln(os.Stderr, "Verification failed! Local staging files were kept for safety.")
 		os.Exit(1)
 	}
@@ -206,6 +244,14 @@ func main() {
 	if *clean {
 		if err := cleanStaging(DefaultStagingDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: failed to clean staging: %v\n", err)
+		}
+	}
+
+	// Step 6: Optionally move files from Google Drive (rclone/save) to local directory
+	if *moveToLocal != "" {
+		if err := MoveRemoteToLocal(*remote, *moveToLocal, *dryRun); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
 	}
 }

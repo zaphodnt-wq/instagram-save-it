@@ -48,11 +48,23 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o ig-save.exe .
 
 ### 3. Daily Usage
 ```bash
-# Dry-run: download 3 saved posts to ./staging and preview rclone transfer
+# Dry-run: download 3 saved posts to ./staging (4 parallel workers by default) and preview rclone transfer
 ./ig-save -u YOUR_IG_USERNAME -n 3 --dry-run
 
 # Live run: upload to gdrive:rclone/save, verify checksums, unsave from Instagram, and clean ./staging
 ./ig-save -u YOUR_IG_USERNAME -n 3 --clean --unsave
+
+# Live run + move all files from gdrive:rclone/save to a local drive (Windows PowerShell example):
+.\ig-save.exe -u YOUR_IG_USERNAME -n 10 --clean --unsave --move-to-local "Y:\eDrive\instagram1\instaGramDL9"
+
+# Move existing files from gdrive:rclone/save to a local drive standalone (without downloading from Instagram):
+.\ig-save.exe --move-to-local "Y:\eDrive\instagram1\instaGramDL9"
+
+# Save directly from ./staging to a local directory (bypassing Google Drive completely):
+.\ig-save.exe -u YOUR_IG_USERNAME -n 10 --clean --unsave --local-dir "Y:\eDrive\instagram1\instaGramDL9"
+
+# Customize parallel download workers (default: -w 4):
+./ig-save -u YOUR_IG_USERNAME -n 20 -w 6 --clean --unsave
 
 # Archive and unsave ALL saved posts
 ./ig-save -u YOUR_IG_USERNAME -n 0 --clean --unsave
@@ -89,9 +101,10 @@ rclone lsf gdrive:rclone/save
 
 ## To-Do List / Next Tasks
 
-- [ ] **Add Parallel Downloads (Goroutines) & Unsave Rate-Limit Pacing in Go (`instagram.go`):**
-  - Download 4 videos concurrently using Go goroutines (matching `rclone --transfers 4`) so large video files don't bottleneck `-n 10+` batches.
-  - Add a brief ~1-second pacing delay between `--unsave` `POST` requests on larger batches (`-n 25+`) to avoid Instagram `429 Too Many Requests` cooldowns.
+- [x] **Add Parallel Downloads (Goroutines / ThreadPoolExecutor) & Unsave Rate-Limit Pacing (`-w` / `--workers`):**
+  - Downloads 4 videos concurrently by default (matching `rclone --transfers 4`) with atomic `.part` file writes and a 1-second pacing delay between `--unsave` `POST` requests.
+- [x] **Local Directory Support (`--move-to-local` / `-m` and `--local-dir` / `-d`):**
+  - Move saved files out of `gdrive:rclone/save` into a local drive (e.g., `Y:\eDrive\instagram1\instaGramDL9`) via `rclone move`, or save directly to a local folder.
 - [ ] **Create a Personal Google Cloud OAuth `client_id` for `rclone` (High Priority before 2026 retirement):**
   - *Quick Note:* Newer versions of `rclone` print a `NOTICE` that `rclone`'s shared built-in Google Drive `client_id` is being retired during 2026 (`https://rclone.org/drive/#making-your-own-client-id`).
   - *How to do it:* Create a personal OAuth Client ID in Google Cloud Console (**APIs & Services -> Credentials -> Create Credentials -> OAuth client ID**), make sure the Application type is set to **Desktop app** (not Web application), copy the `.apps.googleusercontent.com` Client ID and Client Secret into `rclone`, and authorize with `scope=drive.file`. This also removes `rclone`'s shared global API rate limit for even faster uploads!

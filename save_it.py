@@ -1,9 +1,11 @@
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import getpass
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import urllib.parse
@@ -11,7 +13,13 @@ import urllib.parse
 import instaloader
 import requests
 
-from rclone_transfer import DEFAULT_REMOTE_DEST, DEFAULT_STAGING_DIR, transfer_media, verify_media
+from rclone_transfer import (
+    DEFAULT_REMOTE_DEST,
+    DEFAULT_STAGING_DIR,
+    move_remote_to_local,
+    transfer_media,
+    verify_media,
+)
 
 ARCHIVE_LOG_FILE = Path(__file__).parent / ".archived_shortcodes.txt"
 UNSAVED_LOG_FILE = Path(__file__).parent / ".unsaved_shortcodes.txt"
@@ -222,6 +230,7 @@ def download_saved_posts(
     username: str,
     staging_dir: Path = DEFAULT_STAGING_DIR,
     max_count: int = 20,
+    workers: int = 4,
     fast_update: bool = True,
 ) -> list[str]:
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -234,9 +243,10 @@ def download_saved_posts(
         loader.load_session_from_file(username)
 
     archived = load_archived_shortcodes()
-    newly_downloaded: list[str] = []
+    to_download: list[instaloader.Post] = []
+    workers = max(1, workers)
 
-    print(f"Fetching saved posts for @{username} (max_count={max_count})...")
+    print(f"Fetching saved posts for @{username} (max_count={max_count}, workers={workers})...")
     for post in iter_saved_posts(loader, username):
         if post.shortcode in archived:
             if fast_update:
@@ -245,14 +255,29 @@ def download_saved_posts(
             print(f"Skipping already-archived post {post.shortcode}.")
             continue
 
-        print(f"Downloading saved post {post.shortcode}...")
-        loader.download_post(post, target=staging_dir)
-        newly_downloaded.append(post.shortcode)
+        to_download.append(post)
 
-        if max_count and len(newly_downloaded) >= max_count:
-            print(f"Reached max_count={max_count} posts for this run.")
+        if max_count and len(to_download) >= max_count:
+            print(f"Queued max_count={max_count} posts for download.")
             break
 
+    if not to_download:
+        print(f"Downloaded 0 new saved post(s) into {staging_dir}.")
+        return []
+
+    def _download_one(post: instaloader.Post) -> str | None:
+        print(f"Downloading saved post {post.shortcode}...")
+        try:
+            loader.download_post(post, target=staging_dir)
+            return post.shortcode
+        except Exception as exc:
+            print(f"Error downloading {post.shortcode}: {exc}", file=sys.stderr)
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(to_download))) as pool:
+        results = list(pool.map(_download_one, to_download))
+
+    newly_downloaded = [code for code in results if code is not None]
     print(f"Downloaded {len(newly_downloaded)} new saved post(s) into {staging_dir}.")
     return newly_downloaded
 
@@ -316,7 +341,9 @@ def unsave_posts(username: str, shortcodes: list[str]) -> list[str]:
         ).encode()
     ).decode()
 
-    for shortcode in shortcodes:
+    for idx, shortcode in enumerate(shortcodes):
+        if idx > 0:
+            time.sleep(1.0)
         media_id = instaloader.Post.shortcode_to_mediaid(shortcode)
         errors: list[str] = []
         success = False
@@ -385,9 +412,13 @@ def unsave_posts(username: str, shortcodes: list[str]) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download Instagram saved posts and archive them to Google Drive via rclone."
+        description="Download Instagram saved posts and archive them to Google Drive or a local folder via rclone."
     )
-    parser.add_argument("-u", "--username", required=True, help="Your Instagram username")
+    parser.add_argument(
+        "-u",
+        "--username",
+        help="Your Instagram username (required unless running --move-to-local standalone)",
+    )
     parser.add_argument(
         "--login-only",
         action="store_true",
@@ -406,6 +437,13 @@ def main() -> int:
         help="Maximum number of saved posts to download per run (default: 10, 0 for unlimited)",
     )
     parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of concurrent download workers (default: 4)",
+    )
+    parser.add_argument(
         "--no-fast-update",
         action="store_true",
         help="Continue scanning past already-archived posts instead of stopping at the first match",
@@ -413,7 +451,7 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run rclone copy in --dry-run mode without uploading or cleaning staging",
+        help="Run rclone in --dry-run mode without modifying remote/local files or cleaning staging",
     )
     parser.add_argument(
         "--clean",
@@ -423,7 +461,7 @@ def main() -> int:
     parser.add_argument(
         "--unsave",
         action="store_true",
-        help="Remove posts from your Instagram Saved list after Google Drive verification passes",
+        help="Remove posts from your Instagram Saved list after destination verification passes",
     )
     parser.add_argument(
         "--reset-archive",
@@ -435,7 +473,27 @@ def main() -> int:
         default=DEFAULT_REMOTE_DEST,
         help=f"rclone remote destination (default: {DEFAULT_REMOTE_DEST})",
     )
+    parser.add_argument(
+        "-d",
+        "--local-dir",
+        help=r"Save directly from ./staging to a local directory (e.g. Y:\eDrive\instagram1\instaGramDL9) instead of Google Drive",
+    )
+    parser.add_argument(
+        "-m",
+        "--move-to-local",
+        help=r"Move saved files from --remote (gdrive:rclone/save) to a local directory (e.g. Y:\eDrive\instagram1\instaGramDL9) via rclone move",
+    )
     args = parser.parse_args()
+
+    if not args.username and args.move_to_local:
+        return 0 if move_remote_to_local(args.remote, args.move_to_local, dry_run=args.dry_run) else 1
+
+    if not args.username:
+        parser.error("the following arguments are required: -u/--username (unless --move-to-local is used standalone)")
+
+    dest_target = args.local_dir if args.local_dir else args.remote
+    if args.local_dir and not args.dry_run:
+        Path(args.local_dir).mkdir(parents=True, exist_ok=True)
 
     if args.login_only or args.sessionid:
         raw_sessionid = "".join(args.sessionid) if args.sessionid else None
@@ -451,6 +509,7 @@ def main() -> int:
         username=args.username,
         staging_dir=DEFAULT_STAGING_DIR,
         max_count=args.max_count,
+        workers=args.workers,
         fast_update=not args.no_fast_update,
     )
 
@@ -462,18 +521,22 @@ def main() -> int:
             pending_unsave = [c for c in already_archived if c not in already_unsaved]
             if pending_unsave:
                 unsave_posts(args.username, pending_unsave)
-                return 0
+        if args.move_to_local:
+            return 0 if move_remote_to_local(args.remote, args.move_to_local, dry_run=args.dry_run) else 1
         print("No files in staging to transfer.")
         return 0
 
-    if not transfer_media(DEFAULT_STAGING_DIR, args.remote, dry_run=args.dry_run):
+    if not transfer_media(DEFAULT_STAGING_DIR, dest_target, dry_run=args.dry_run):
         return 1
 
     if args.dry_run:
+        if args.move_to_local:
+            if not move_remote_to_local(args.remote, args.move_to_local, dry_run=True):
+                return 1
         print("Dry-run complete. Staging files and archive log were not modified.")
         return 0
 
-    if not verify_media(DEFAULT_STAGING_DIR, args.remote):
+    if not verify_media(DEFAULT_STAGING_DIR, dest_target):
         print("Verification failed! Local staging files were kept for safety.", file=sys.stderr)
         return 1
 
@@ -488,6 +551,10 @@ def main() -> int:
 
     if args.clean:
         clean_staging(DEFAULT_STAGING_DIR)
+
+    if args.move_to_local:
+        if not move_remote_to_local(args.remote, args.move_to_local, dry_run=args.dry_run):
+            return 1
 
     return 0
 

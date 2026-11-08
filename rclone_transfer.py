@@ -60,6 +60,39 @@ def verify_media(
     return True
 
 
+def move_remote_to_local(
+    remote_src: str = DEFAULT_REMOTE_DEST,
+    local_dest: str | Path = "",
+    dry_run: bool = False,
+) -> bool:
+    """Move media files from remote_src (e.g. gdrive:rclone/save) to a local directory via rclone move."""
+    local_path = Path(local_dest)
+    if not dry_run:
+        local_path.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "rclone",
+        "move",
+        remote_src,
+        str(local_dest),
+        "--include", "*.{jpg,jpeg,png,mp4}",
+        "--transfers", "4",
+        "--checkers", "8",
+        "--progress",
+        "-v",
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+
+    print(f"Moving from {remote_src} to local directory {local_dest}: {' '.join(cmd)}", flush=True)
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"rclone move failed with code {result.returncode}", file=sys.stderr)
+        return False
+    print(f"Successfully moved files from {remote_src} to {local_dest}.")
+    return True
+
+
 if __name__ == "__main__":
     dry_run_flag = "--live" not in sys.argv
     DEFAULT_STAGING_DIR.mkdir(parents=True, exist_ok=True)
