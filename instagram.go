@@ -86,7 +86,7 @@ func SaveSessionWithCookie(username, rawSessionID string) (*IGSession, error) {
 	sess := &IGSession{
 		Username:  username,
 		SessionID: cleanID,
-		CSRFToken: "missing",
+		CSRFToken: "",
 		DSUserID:  dsUserID,
 	}
 
